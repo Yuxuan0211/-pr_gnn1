@@ -1,0 +1,25 @@
+free_stream:
+  V: 100.0
+  P: 101325.0
+  rho: 1.225
+  h: 300000.0
+
+P_inf: 101325.0
+rho_inf: 1.225
+V_inf: 100.0
+h_inf: 300000.0
+
+loss_weights:
+  thermo: 1.0
+  vorticity: 10.0
+  energy: 1.0
+  noslip: 5.0
+  wake: 1.0
+  inviscid: 0.5
+  freestream: 10.0
+
+device: 'cuda' 
+lr: 0.001
+pre_epochs: 100
+finetune_epochs: 500
+hidden_dim: 64
