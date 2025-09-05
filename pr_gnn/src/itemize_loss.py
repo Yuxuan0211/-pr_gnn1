@@ -98,9 +98,30 @@ def loss_inviscid(Q_pred: torch.Tensor, mask_inviscid: torch.Tensor) -> torch.Te
     return (mu_t_pred ** 2).mean()
 
 
-def loss_freestream(Q_pred: torch.Tensor, Q_inf: torch.Tensor, mask_freestream: torch.Tensor) -> torch.Tensor:
+def loss_freestream(Q_pred: torch.Tensor, Q_inf, mask_freestream: torch.Tensor) -> torch.Tensor:
     """《分区物理0.17.pdf》2.5.4节来流区损失：L_freestream = 1/|V4| × sum(||Q_pred - Q∞||²)"""
     if mask_freestream.sum() == 0:
         return torch.tensor(0.0, dtype=torch.float32)
     
-    return F.mse_loss(Q_pred[mask_freestream], Q_inf.repeat(mask_freestream.sum(), 1), reduction="mean")
+    # 处理Q_inf的不同数据结构情况
+    if isinstance(Q_inf, dict):
+        # 从字典中提取来流参数
+        V_inf = Q_inf.get('V', 100)
+        P_inf = Q_inf.get('P', 101325)
+        rho_inf = Q_inf.get('rho', 1.225)
+        h_inf = Q_inf.get('h', 300e3)
+        
+        # 创建与Q_pred结构匹配的来流张量
+        Q_inf_tensor = torch.zeros_like(Q_pred[mask_freestream])
+        Q_inf_tensor[:, 0] = V_inf  # Vx
+        Q_inf_tensor[:, 1] = V_inf  # Vy (假设与Vx相同)
+        Q_inf_tensor[:, 2] = V_inf  # Vz (假设与Vx相同)
+        Q_inf_tensor[:, 6] = P_inf  # Pressure
+        Q_inf_tensor[:, 7] = rho_inf  # Density
+        Q_inf_tensor[:, 9] = h_inf  # Enthalpy
+        
+        return F.mse_loss(Q_pred[mask_freestream], Q_inf_tensor, reduction="mean")
+    elif isinstance(Q_inf, torch.Tensor):
+        return F.mse_loss(Q_pred[mask_freestream], Q_inf.repeat(mask_freestream.sum(), 1), reduction="mean")
+    else:
+        raise ValueError(f"不支持的Q_inf类型: {type(Q_inf)}")

@@ -60,7 +60,7 @@ class PRGNN_GUI(QMainWindow):
         self.btn_adj.clicked.connect(self.load_adj_csv)
         layout.addWidget(self.btn_adj)
 
-        self.btn_csv = QPushButton("选择节点数据 CSV")
+        self.btn_csv = QPushButton("选择节点数据 CSV(可多选)")
         self.btn_csv.clicked.connect(self.load_csv)
         layout.addWidget(self.btn_csv)
 
@@ -68,10 +68,17 @@ class PRGNN_GUI(QMainWindow):
         param_group = QGroupBox("训练参数配置")
         param_layout = QFormLayout()
         
-        # 基础参数
+        # 基础训练参数
         self.lr_input = QLineEdit("0.001")
         self.pre_epochs_input = QLineEdit("100")
         self.fine_epochs_input = QLineEdit("500")
+        
+        # 神经网络结构参数
+        self.hidden_dim_input = QLineEdit("64")
+        self.num_layers_input = QLineEdit("2")
+        self.dropout_input = QLineEdit("0.1")
+        self.batch_norm_check = QCheckBox("启用批归一化")
+        self.batch_norm_check.setChecked(True)
         
         # 损失权重
         self.w_thermo = QLineEdit("1.0")
@@ -84,9 +91,20 @@ class PRGNN_GUI(QMainWindow):
         self.lambda_phys = QLineEdit("1.0")
         
         # 添加控件
+        # 添加神经网络结构配置
+        param_layout.addRow(QLabel("神经网络结构"))
+        param_layout.addRow("隐藏层维度", self.hidden_dim_input)
+        param_layout.addRow("网络层数", self.num_layers_input)
+        param_layout.addRow("Dropout率", self.dropout_input)
+        param_layout.addRow(self.batch_norm_check)
+        
+        # 添加训练参数
+        param_layout.addRow(QLabel("训练参数"))
         param_layout.addRow("学习率", self.lr_input)
         param_layout.addRow("预训练轮数", self.pre_epochs_input)
         param_layout.addRow("微调轮数", self.fine_epochs_input)
+        
+        # 添加损失权重
         param_layout.addRow(QLabel("损失权重"))
         param_layout.addRow("热力学损失", self.w_thermo)
         param_layout.addRow("涡量损失", self.w_vorticity)
@@ -137,16 +155,20 @@ class PRGNN_GUI(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "选择 图邻接 CSV 文件", "", "*.csv")
         if path:
             from pr_gnn.src.csv_graph_loader import save_adjacency_csv, load_adjacency_from_csv
+            import traceback
             try:
                 adj = load_adjacency_from_csv(path)
                 save_adjacency_csv(adj, "data/processed/adjacency.csv")
-                self.log.append(f"✅ 已生成邻接矩阵: adjacency.csv")
+                self.log.append(f"已生成邻接矩阵: adjacency.csv")
             except Exception as e:
-                self.log.append(f"❌ CSV 解析失败: {e}")
+                error_msg = f"❌ CSV 解析失败:\n{traceback.format_exc()}"
+                self.log.append(error_msg)
+                QMessageBox.critical(self, "错误", f"CSV解析失败:\n{str(e)}")
 
     def load_model(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择模型文件", "models/saved", "*.pth")
         if path:
+            import traceback
             try:
                 if self.model is None:
                     # 如果模型未初始化，先创建默认模型
@@ -155,9 +177,11 @@ class PRGNN_GUI(QMainWindow):
                     self.trainer = PRGNNTrainer(self.model, config)
                 
                 self.trainer.load_model(path)
-                self.log.append(f"✅ 模型已加载: {path}")
+                self.log.append(f"模型已加载: {path}")
             except Exception as e:
-                self.log.append(f"❌ 模型加载失败: {e}")
+                error_msg = f"❌ 模型加载失败:\n{traceback.format_exc()}"
+                self.log.append(error_msg)
+                QMessageBox.critical(self, "错误", f"模型加载失败:\n{str(e)}")
 
     def _get_config_from_ui(self):
         return {
@@ -173,36 +197,80 @@ class PRGNN_GUI(QMainWindow):
                 'freestream': float(self.w_freestream.text())
             },
             'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-            'lr': float(self.lr_input.text()),
+            # 模型结构参数
+            'hidden_channels': int(self.hidden_dim_input.text()),
+            'num_layers': int(self.num_layers_input.text()),
+            'dropout': float(self.dropout_input.text()),
+            'batch_norm': self.batch_norm_check.isChecked(),
+            
+            'training': {
+                'mixed_precision': True,
+                'lr': float(self.lr_input.text()),
+                'weight_decay': 0.01,
+                'warmup_epochs': 10,
+                'cosine_epochs': 100,
+                'batch_size': 32,
+                'neighbor_sampling': False,  # 默认关闭邻居采样
+                'num_neighbors': 25,  # 邻居采样数量
+                'early_stopping_patience': 20,  # 早停耐心值
+                'min_epochs': 50  # 最小训练轮数
+            },
             'pre_epochs': int(self.pre_epochs_input.text()),
             'lambda_phys': float(self.lambda_phys.text())
         }
 
     def load_csv(self):
-        path, _ = QFileDialog.getOpenFileName(self, "选择节点数据 CSV", "", "*.csv")
-        if path:
+        paths, _ = QFileDialog.getOpenFileNames(self, "选择节点数据 CSV 文件", "", "*.csv")
+        if paths:
+            import traceback
             try:
                 config = self._get_config_from_ui()
-                dataset = FlowDataset("data/processed/adjacency.csv", path, config)
-                self.data, self.scaler_x, self.scaler_y = dataset.load_data()
+                total_nodes = 0
+                loaded_files = 0
+                
+                for i, path in enumerate(paths):
+                    dataset = FlowDataset("data/processed/adjacency.csv", path, config)
+                    data, scaler_x, scaler_y = dataset.load_data()
+                    
+                    if i == 0:
+                        self.data = data
+                        self.scaler_x = scaler_x
+                        self.scaler_y = scaler_y
+                    else:
+                        # 合并数据，保持Data对象结构
+                        self.data.x = torch.cat([self.data.x, data.x], dim=0)
+                        self.data.y = torch.cat([self.data.y, data.y], dim=0)
+                        # 更新节点数
+                        self.data.num_nodes = self.data.x.size(0)
+                    
+                    total_nodes += data.num_nodes
+                    loaded_files += 1
+                    self.log.append(f"[{i+1}/{len(paths)}] 已加载文件: {os.path.basename(path)} (节点数: {data.num_nodes})")
                 
                 if self.model is None:  # 如果模型未加载
                     self.model = PRGNN(in_channels=7, hidden_channels=64).to(config['device'])
                     self.trainer = PRGNNTrainer(self.model, config)
-                self.log.append(f"✅ 数据加载完成，节点数: {self.data.num_nodes}")
+                
+                self.log.append(f"数据加载完成 - 共加载 {loaded_files} 个文件，总节点数: {total_nodes}")
+                QMessageBox.information(self, "加载完成", f"成功加载 {loaded_files} 个CSV文件\n总节点数: {total_nodes}")
             except Exception as e:
-                self.log.append(f"❌ 数据加载失败: {e}")
+                error_msg = f"数据加载失败:\n{traceback.format_exc()}"
+                self.log.append(error_msg)
+                QMessageBox.critical(self, "错误", f"数据加载失败:\n{str(e)}")
 
     def convert_stl_to_csv(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择 STL 文件", "", "*.stl")
         if path:
+            import traceback
             try:
                 from pr_gnn.src.stl_to_graph import convert_stl_to_csv
                 output_path = os.path.join("data/raw", os.path.basename(path).replace('.stl', '.csv'))
                 convert_stl_to_csv(path, output_path)
-                self.log.append(f"✅ STL 转换完成: {output_path}")
+                self.log.append(f"STL 转换完成: {output_path}")
             except Exception as e:
-                self.log.append(f"❌ STL 转换失败: {e}")
+                error_msg = f"STL 转换失败:\n{traceback.format_exc()}"
+                self.log.append(error_msg)
+                QMessageBox.critical(self, "错误", f"STL转换失败:\n{str(e)}")
 
     def start_training(self):
         if self.data is None:
@@ -214,11 +282,11 @@ class PRGNN_GUI(QMainWindow):
             
             if self.radio_pre.isChecked():
                 self.trainer.regional_pretrain(self.data)
-                self.log.append("✅ 预训练完成")
+                self.log.append("预训练完成")
             else:
                 epochs = int(self.fine_epochs_input.text())
                 self.trainer.global_finetune(self.data, epochs=epochs)
-                self.log.append("✅ 微调完成")
+                self.log.append("微调完成")
         except Exception as e:
             import traceback
             error_msg = f"❌ 训练失败\n\n错误类型: {type(e).__name__}\n\n错误详情: {str(e)}\n\n调用栈:\n"
@@ -318,14 +386,14 @@ class PRGNN_GUI(QMainWindow):
                     
                     # 使用UTF-8编码保存，确保中文正常显示
                     pd.DataFrame(result_data).to_csv(save_path, index=False, encoding='utf-8-sig')
-                    self.log.append(f"✅ 马赫数 {mach:.2f} 预测结果已保存")
+                    self.log.append(f"马赫数 {mach:.2f} 预测结果已保存")
                     
                 except Exception as e:
-                    self.log.append(f"❌ 马赫数 {mach:.2f} 预测失败: {str(e)}")
+                    self.log.append(f"马赫数 {mach:.2f} 预测失败: {str(e)}")
                     continue
                     
         except Exception as e:
-            self.log.append(f"❌ 预测流程出错: {str(e)}")
+            self.log.append(f"预测流程出错: {str(e)}")
 
     def save_model(self):
         if self.model is None: return

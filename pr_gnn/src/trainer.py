@@ -42,11 +42,13 @@ except ImportError:
                     if self.verbose:
                         print(f'将学习率从 {old_lr:.2e} 降低到 {new_lr:.2e}')
 
+import math
 from tqdm import tqdm
 import os
 import sys
 import numpy as np
 from typing import Dict, List, Optional, Tuple
+from torch_geometric.loader import NeighborSampler
 
 # 添加项目根目录到Python路径
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -81,21 +83,31 @@ class PRGNNTrainer:
         self.device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
         self.model.to(self.device)
         
-        # 优化器初始化
-        self.optimizer = Adam(
+        # 混合精度训练初始化
+        self.scaler = torch.cuda.amp.GradScaler(enabled=config['training']['mixed_precision'])
+        
+        # 优化器初始化 (AdamW with weight decay)
+        self.optimizer = torch.optim.AdamW(
             model.parameters(),
-            lr=config.get('lr', 0.001),
-            weight_decay=config.get('weight_decay', 1e-5)
+            lr=config['training']['lr'],
+            weight_decay=config['training']['weight_decay']
         )
         
-        # 学习率调度器
-        self.scheduler = ReduceLROnPlateau(
-            self.optimizer,
-            mode='min',
-            factor=config.get('lr_factor', 0.5),
-            patience=config.get('lr_patience', 10),
-            min_lr=config.get('min_lr', 1e-6),
-            verbose=True
+        # 学习率调度器 (预热 + 余弦衰减)
+        warmup_epochs = config['training']['warmup_epochs']
+        cosine_epochs = config['training']['cosine_epochs']
+        total_steps = warmup_epochs + cosine_epochs
+        
+        def lr_lambda(current_step):
+            if current_step < warmup_epochs:
+                return float(current_step) / float(max(1, warmup_epochs))
+            progress = float(current_step - warmup_epochs) / float(max(1, cosine_epochs))
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+            
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer, 
+            lr_lambda,
+            last_epoch=-1
         )
         
         # 物理损失计算器
@@ -145,13 +157,16 @@ class PRGNNTrainer:
 
         # 按区域进行预训练
         for region_id in range(5):
-            print(f"\n=== 预训练阶段: 区域 {region_id} ===")
             region_mask_bool = (region_mask == region_id)
+            region_nodes = region_mask_bool.sum().item()
             
-            # 跳过无节点的区域
-            if not region_mask_bool.any():
-                print(f"⚠️  区域 {region_id} 无节点，跳过该区域")
+            if region_nodes == 0:
+                print(f"⏩ 区域 {region_id} 无节点，自动进入下一区域")
                 continue
+                
+            print(f"\n=== 开始预训练区域 {region_id} ===")
+            print(f"📊 区域节点数: {region_nodes}")
+            print(f"⏳ 训练轮数: {adjusted_epochs}")
             
             # 重置该区域的收敛计数器
             self.train_state['converge_count'] = 0
@@ -185,7 +200,11 @@ class PRGNNTrainer:
                 )
                 total_loss.backward()
                 self.optimizer.step()
-
+                
+                # 每10轮打印一次进度
+                if (epoch + 1) % 10 == 0 or epoch == adjusted_epochs - 1:
+                    print(f"🏁 区域 {region_id} - 轮次 {epoch + 1}/{adjusted_epochs} - 当前损失: {total_loss.item():.4f}")
+                
                 # 记录训练损失
                 self.train_state['train_loss_history'].append(total_loss.item())
 
@@ -220,7 +239,7 @@ class PRGNNTrainer:
                         print(f"🎉 区域 {region_id} 预训练提前收敛，停止训练")
                         break
 
-            print(f"=== 区域 {region_id} 预训练完成 ===")
+            print(f"✅ 区域 {region_id} 预训练完成")
 
         # 返回训练历史
         return {
@@ -238,14 +257,29 @@ class PRGNNTrainer:
         region_mask = self._get_region_mask(data)
         total_nodes = len(data.y)
         
-        # 动态调整batch size
-        if total_nodes > 10000:
-            batch_size = 1024
-        elif total_nodes > 5000:
-            batch_size = 512
+        # 邻居采样配置
+        if self.config['training']['neighbor_sampling']:
+            num_neighbors = [self.config['training']['num_neighbors']] * self.config['training']['num_layers']
+            batch_size = min(2048, total_nodes)  # 邻居采样时使用较小的batch size
+            
+            train_loader = NeighborSampler(
+                data.edge_index, 
+                node_idx=None, 
+                sizes=num_neighbors,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=0
+            )
+            print(f"📊 全局微调配置：总节点数{total_nodes}，邻居采样batch size={batch_size}，邻居数={num_neighbors}")
         else:
-            batch_size = 256
-        print(f"📊 全局微调配置：总节点数{total_nodes}，batch size{batch_size}，最大轮数{epochs}")
+            # 动态调整batch size
+            if total_nodes > 10000:
+                batch_size = 1024
+            elif total_nodes > 5000:
+                batch_size = 512
+            else:
+                batch_size = 256
+            print(f"📊 全局微调配置：总节点数{total_nodes}，batch size={batch_size}，最大轮数={epochs}")
 
         # 梯度累积参数
         grad_accum_steps = self.config.get('grad_accum_steps', 1)
@@ -254,7 +288,51 @@ class PRGNNTrainer:
 
         # 微调训练循环
         for epoch in tqdm(range(epochs), desc="全局微调"):
-            self.train_state['current_epoch'] += 1
+            if self.config['training']['neighbor_sampling']:
+                # 邻居采样训练
+                total_train_loss = 0.0
+                batch_count = 0
+                
+                for batch_size, n_id, adjs in train_loader:
+                    adjs = [adj.to(self.device) for adj in adjs]
+                    self.optimizer.zero_grad() if batch_count % grad_accum_steps == 0 else None
+                    
+                    # 混合精度训练
+                    with torch.cuda.amp.autocast(enabled=self.config['training']['mixed_precision']):
+                        out = self.model(data.x[n_id], adjs)
+                        
+                        # 处理pos数据
+                        pos = None
+                        if hasattr(data, 'pos') and data.pos is not None:
+                            pos = data.pos[n_id]
+                        
+                        temp_data = SimpleData(
+                            y=data.y[n_id],
+                            pos=pos
+                        )
+                        
+                        batch_loss, _ = self.physics_loss(
+                            out,
+                            temp_data,
+                            region_mask[n_id]
+                        )
+                        batch_loss = batch_loss / grad_accum_steps
+                    
+                    self.scaler.scale(batch_loss).backward()
+                    total_train_loss += batch_loss.item() * grad_accum_steps
+                    batch_count += 1
+
+                    # 累积到指定步数后更新参数
+                    if batch_count % grad_accum_steps == 0:
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                        self.scheduler.step()
+                
+                # 计算平均训练损失
+                avg_train_loss = total_train_loss / batch_count
+                self.train_state['train_loss_history'].append(avg_train_loss)
+            else:
+                self.train_state['current_epoch'] += 1
             current_lr = self.optimizer.param_groups[0]['lr']
             self.train_state['lr_history'].append(current_lr)
             

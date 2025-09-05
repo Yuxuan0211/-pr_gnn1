@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import SAGEConv
+from torch_sparse import SparseTensor
 from torch.autograd import grad
 import numpy as np
 
@@ -14,7 +15,17 @@ class PRGNN(nn.Module):
         self.gamma = 1.4
 
     def forward(self, x, edge_index):
-        h = self.encoder(x, edge_index)
+        # 支持SparseTensor或edge_index输入
+        if isinstance(edge_index, SparseTensor):
+            h = self.encoder(x, edge_index)
+        else:
+            # 将edge_index转换为SparseTensor
+            adj = SparseTensor(
+                row=edge_index[0], 
+                col=edge_index[1],
+                sparse_sizes=(x.size(0), x.size(0))
+            )
+            h = self.encoder(x, adj)
         q_pred = self.decoder(h)
         return q_pred, h
 
@@ -24,9 +35,14 @@ class GraphSAGEEncoder(nn.Module):
         self.conv1 = SAGEConv(in_channels, hidden_channels)
         self.conv2 = SAGEConv(hidden_channels, hidden_channels)
 
-    def forward(self, x, edge_index):
-        x = F.relu(self.conv1(x, edge_index))
-        x = F.relu(self.conv2(x, edge_index))
+    def forward(self, x, adj):
+        # 支持SparseTensor或edge_index输入
+        if isinstance(adj, SparseTensor):
+            x = F.relu(self.conv1(x, adj))
+            x = F.relu(self.conv2(x, adj))
+        else:
+            x = F.relu(self.conv1(x, adj))
+            x = F.relu(self.conv2(x, adj))
         return x
 
 class MLPDecoder(nn.Module):

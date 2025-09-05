@@ -9,6 +9,51 @@ rho_inf: 1.225
 V_inf: 100.0
 h_inf: 300000.0
 
+# New parameters for improved training
+training:
+  # Optimizer settings
+  optimizer: 'AdamW'
+  weight_decay: 0.01
+  lr: 0.001
+  min_lr: 1e-6
+  
+  # Learning rate schedule
+  lr_schedule: 'cosine_with_warmup'
+  warmup_epochs: 10
+  cosine_epochs: 100
+  
+  # Mixed precision training
+  mixed_precision: True
+  
+  # Neighbor sampling
+  neighbor_sampling: True
+  num_neighbors: 25
+  num_layers: 2
+  
+  # Early stopping
+  early_stopping_patience: 20
+  min_epochs: 50
+
+# Region normalization settings
+region_normalization:
+  enabled: True
+  num_regions: 5
+
+# Pretraining settings
+pretrain:
+  multi_mach: True
+  mach_numbers: [0.3, 0.5, 0.8, 1.2, 1.5]
+  batch_mix: True
+  
+  # Region-specific training
+  region_weights: [1.0, 1.5, 1.2, 1.0, 0.8]
+
+# Model architecture
+model:
+  hidden_dim: 64
+  use_sparse_tensor: True
+
+# Original loss weights
 loss_weights:
   thermo: 1.0
   vorticity: 10.0
@@ -17,9 +62,3 @@ loss_weights:
   wake: 1.0
   inviscid: 0.5
   freestream: 10.0
-
-device: 'cuda' 
-lr: 0.001
-pre_epochs: 100
-finetune_epochs: 500
-hidden_dim: 64

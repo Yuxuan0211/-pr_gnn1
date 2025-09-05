@@ -19,6 +19,14 @@ class PhysicsLoss:
         self.get_config = get_config_value
         
     def __call__(self, pred, true, region_mask):
+        # 多马赫数数据处理
+        if hasattr(true, 'multi_mach_y'):
+            # 随机选择一个马赫数进行训练
+            mach_idx = torch.randint(0, true.multi_mach_y.size(1), (1,)).item()
+            true_y = true.multi_mach_y[:, mach_idx]
+        else:
+            true_y = true.y if hasattr(true, 'y') else true
+            
         # 构造mask字典
         masks = {
             "boundary": (region_mask == 0),
