@@ -19,14 +19,6 @@ class PhysicsLoss:
         self.get_config = get_config_value
         
     def __call__(self, pred, true, region_mask):
-        # 多马赫数数据处理
-        if hasattr(true, 'multi_mach_y'):
-            # 随机选择一个马赫数进行训练
-            mach_idx = torch.randint(0, true.multi_mach_y.size(1), (1,)).item()
-            true_y = true.multi_mach_y[:, mach_idx]
-        else:
-            true_y = true.y if hasattr(true, 'y') else true
-            
         # 构造mask字典
         masks = {
             "boundary": (region_mask == 0),
@@ -55,15 +47,42 @@ class PhysicsLoss:
         # 合并默认值和配置值
         weights = {**default_weights, **self.config}
         
+        # 处理输入数据
+        print(f"Input true type: {type(true)}")  # 调试日志
+        
+        # 处理SimpleData对象
+        if hasattr(true, 'y'):
+            true = true.y
+            print(f"After getting y attribute: {type(true)}")
+        
+        # 处理multi_mach_y情况
+        if hasattr(true, 'multi_mach_y'):
+            print("Found multi_mach_y attribute")
+            true = true.multi_mach_y
+            if isinstance(true, (tuple, list)):
+                true = torch.stack(true) if len(true) > 0 else torch.tensor([])
+            true = true.mean(dim=1)  # 取各马赫数平均值
+        
+        # 处理tuple/list情况
+        elif isinstance(true, (tuple, list)):
+            print(f"Converting tuple/list to tensor: {len(true)} elements")
+            true = torch.stack(true) if len(true) > 0 else torch.tensor([])
+        
+        # 处理非tensor情况
+        elif not isinstance(true, torch.Tensor):
+            print(f"Converting non-tensor to tensor: {type(true)}")
+            true = torch.as_tensor(true)
+        
+        # 最终类型检查
+        if not isinstance(true, torch.Tensor):
+            raise ValueError(f"无法将输入转换为张量，最终类型: {type(true)}")
+        
+        print(f"Final true type: {type(true)}, shape: {true.shape if isinstance(true, torch.Tensor) else 'N/A'}")
+        
         # 计算各项loss
         L_sup = loss_supervised(pred, true)
         L_thermo = loss_thermo(pred, gamma) * weights["w_thermo"]
-        # 处理涡量计算的位置信息
-        pos = true.pos if hasattr(true, 'pos') else None
-        if pos is None:
-            L_vort = torch.tensor(0.0, device=pred.device)
-        else:
-            L_vort = loss_vorticity(pred, true, pos) * weights["w_vorticity"]
+        L_vort = loss_vorticity(pred, true) * weights["w_vorticity"]
         L_noslip = loss_noslip(pred, masks["boundary"]) * weights["w_noslip"]
         L_wake = loss_wake(pred, masks["wake"]) * weights["w_wake"]
         L_energy = loss_energy(pred, free_stream, 

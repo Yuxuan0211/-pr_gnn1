@@ -49,6 +49,7 @@ import sys
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from torch_geometric.loader import NeighborSampler
+from torch_sparse import SparseTensor
 
 # 添加项目根目录到Python路径
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -57,24 +58,52 @@ sys.path.append(project_root)
 from pr_gnn.src.physics_loss import PhysicsLoss
 from pr_gnn.src.assign_regions import get_regional_masks
 
-class SimpleData(torch.Tensor):
-    def __new__(cls, y, pos=None):
-        # 使用y作为基础张量
-        instance = super().__new__(cls, y)
-        instance.pos = pos
-        return instance
-    
+class SimpleData:
     def __init__(self, y, pos=None):
-        super().__init__()
         # 确保y是张量
-        if not isinstance(y, torch.Tensor):
-            self.data = torch.as_tensor(y)
+        if isinstance(y, torch.Tensor):
+            self.y = y
+        elif isinstance(y, (tuple, list)):
+            print(f"⚠️  Warning: Converting tuple/list to tensor (length: {len(y)})")
+            try:
+                self.y = torch.stack(y) if len(y) > 0 else torch.tensor([])
+            except Exception as e:
+                raise ValueError(f"无法将tuple/list转换为张量: {str(e)}")
         else:
-            self.data = y
-        self.pos = pos
+            try:
+                self.y = torch.as_tensor(y)
+                if not isinstance(self.y, torch.Tensor):
+                    raise ValueError(f"转换失败，结果类型: {type(self.y)}")
+            except Exception as e:
+                raise ValueError(f"无法将输入转换为张量，类型: {type(y)}. 错误: {str(e)}")
+        
+        # 确保y是二维张量 (num_nodes, num_features)
+        if len(self.y.shape) == 1:
+            self.y = self.y.unsqueeze(1)
+        elif len(self.y.shape) != 2:
+            raise ValueError(f"y的形状应为2D (num_nodes, num_features)，实际为: {self.y.shape}")
+            
+        self.pos = pos if pos is not None else None
     
-    def size(self, *args, **kwargs):
-        return self.data.size(*args, **kwargs)
+    def __getattr__(self, name):
+        # 将属性访问转发到y张量
+        if name in ['size', 'shape', 'device', 'dtype']:
+            return getattr(self.y, name)
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+    
+    def __iter__(self):
+        # 防止被当作元组处理
+        raise TypeError(f"'{type(self).__name__}' object is not iterable")
+    
+    def __array__(self):
+        # 支持numpy转换
+        return self.y.numpy()
+    
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        # 支持torch函数调用
+        if kwargs is None:
+            kwargs = {}
+        return func(self.y, *args, **kwargs)
 
 class PRGNNTrainer:
     def __init__(self, model, config):
@@ -257,6 +286,9 @@ class PRGNNTrainer:
         region_mask = self._get_region_mask(data)
         total_nodes = len(data.y)
         
+        # 初始化train_loader
+        train_loader = None
+        
         # 邻居采样配置
         if self.config['training']['neighbor_sampling']:
             num_neighbors = [self.config['training']['num_neighbors']] * self.config['training']['num_layers']
@@ -273,12 +305,27 @@ class PRGNNTrainer:
             print(f"📊 全局微调配置：总节点数{total_nodes}，邻居采样batch size={batch_size}，邻居数={num_neighbors}")
         else:
             # 动态调整batch size
-            if total_nodes > 10000:
-                batch_size = 1024
-            elif total_nodes > 5000:
-                batch_size = 512
-            else:
-                batch_size = 256
+            min_batch_size = 64
+            max_batch_size = 2048
+            target_batches = 100  # 目标批次数
+            
+            # 智能计算batch size
+            batch_size = min(
+                max_batch_size,
+                max(min_batch_size, total_nodes // target_batches)
+            )
+            
+            # 创建虚拟train_loader以保持代码结构一致
+            train_loader = [(batch_size, torch.arange(total_nodes), [])]  # 使用元组模拟NeighborSampler输出
+            
+            # 确保不超过显存限制
+            if torch.cuda.is_available():
+                free_mem = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)
+                safe_batch_size = min(batch_size, free_mem // (1024 * 1024 * 10))  # 估算10MB/样本
+                if safe_batch_size < batch_size:
+                    print(f"⚠️  显存限制，batch size从{batch_size}调整为{safe_batch_size}")
+                    batch_size = safe_batch_size
+            
             print(f"📊 全局微调配置：总节点数{total_nodes}，batch size={batch_size}，最大轮数={epochs}")
 
         # 梯度累积参数
@@ -287,10 +334,17 @@ class PRGNNTrainer:
             print(f"⚠️  启用梯度累积，累积步数：{grad_accum_steps}")
 
         # 微调训练循环
-        for epoch in tqdm(range(epochs), desc="全局微调"):
-            if self.config['training']['neighbor_sampling']:
-                # 邻居采样训练
-                total_train_loss = 0.0
+        with tqdm(range(epochs), desc="全局微调", unit="epoch") as pbar:
+            for epoch in pbar:
+                # 更新进度条描述
+                pbar.set_postfix({
+                    'batch': f"{batch_size}/{total_nodes}",
+                    'lr': f"{self.optimizer.param_groups[0]['lr']:.1e}"
+                })
+                
+                if self.config['training']['neighbor_sampling']:
+                    # 邻居采样训练
+                    total_train_loss = 0.0
                 batch_count = 0
                 
                 for batch_size, n_id, adjs in train_loader:
@@ -299,34 +353,63 @@ class PRGNNTrainer:
                     
                     # 混合精度训练
                     with torch.cuda.amp.autocast(enabled=self.config['training']['mixed_precision']):
-                        out = self.model(data.x[n_id], adjs)
+                        # 将adjs转换为SparseTensor格式
+                        if len(adjs) > 0 and hasattr(adjs[0], 'edge_index'):
+                            # 确保只使用当前批次的节点
+                            batch_nodes = n_id[:batch_size]
+                            adj = SparseTensor(
+                                row=adjs[0].edge_index[0],
+                                col=adjs[0].edge_index[1],
+                                sparse_sizes=(len(batch_nodes), len(batch_nodes))
+                            )
+                            out = self.model(data.x[batch_nodes], adj)
+                        else:
+                            # 如果没有有效的邻接信息，使用全连接
+                            batch_nodes = n_id[:batch_size]
+                            adj = SparseTensor(
+                                row=torch.arange(len(batch_nodes), device=self.device),
+                                col=torch.arange(len(batch_nodes), device=self.device),
+                                sparse_sizes=(len(batch_nodes), len(batch_nodes))
+                            )
+                            out = self.model(data.x[batch_nodes], adj)
                         
                         # 处理pos数据
                         pos = None
                         if hasattr(data, 'pos') and data.pos is not None:
                             pos = data.pos[n_id]
                         
-                        temp_data = SimpleData(
-                            y=data.y[n_id],
-                            pos=pos
-                        )
-                        
-                        batch_loss, _ = self.physics_loss(
-                            out,
-                            temp_data,
-                            region_mask[n_id]
-                        )
-                        batch_loss = batch_loss / grad_accum_steps
-                    
-                    self.scaler.scale(batch_loss).backward()
-                    total_train_loss += batch_loss.item() * grad_accum_steps
-                    batch_count += 1
+                # 调试日志
+                print(f"data.y type before SimpleData: {type(data.y)}")
+                if hasattr(data.y, 'shape'):
+                    print(f"data.y shape: {data.y.shape}")
+                elif isinstance(data.y, (tuple, list)):
+                    print(f"data.y length: {len(data.y)}")
+                
+                # 确保y是tensor
+                y_tensor = torch.as_tensor(data.y[n_id]) if not isinstance(data.y[n_id], torch.Tensor) else data.y[n_id]
+                print(f"y_tensor type: {type(y_tensor)}, shape: {y_tensor.shape}")
+                
+                temp_data = SimpleData(
+                    y=y_tensor,
+                    pos=pos
+                )
+                
+                batch_loss, _ = self.physics_loss(
+                    out,
+                    temp_data,
+                    region_mask[n_id]
+                )
+                
+                batch_loss = batch_loss / grad_accum_steps
+                self.scaler.scale(batch_loss).backward()
+                total_train_loss += batch_loss.item() * grad_accum_steps
+                batch_count += 1
 
-                    # 累积到指定步数后更新参数
-                    if batch_count % grad_accum_steps == 0:
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-                        self.scheduler.step()
+                # 累积到指定步数后更新参数
+                if batch_count % grad_accum_steps == 0:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.scheduler.step()
                 
                 # 计算平均训练损失
                 avg_train_loss = total_train_loss / batch_count
@@ -409,10 +492,14 @@ class PRGNNTrainer:
                     self.save_model("models/best_finetune.pth")
                     self.save_train_state("models/best_finetune_state.pth")
                 
-                # 如果收敛，提前停止微调
-                if is_converged:
-                    print(f"🎉 全局微调提前收敛，停止训练（总训练轮数：{self.train_state['current_epoch']}）")
-                    break
+            # 如果收敛，提前停止微调
+            if is_converged:
+                print(f"🎉 全局微调提前收敛，停止训练（总训练轮数：{self.train_state['current_epoch']}）")
+                return {
+                    'train_loss': self.train_state['train_loss_history'],
+                    'val_loss': self.train_state['val_loss_history'],
+                    'lr_history': self.train_state['lr_history']
+                }
 
         print("=== 全局微调完成 ===")
 
