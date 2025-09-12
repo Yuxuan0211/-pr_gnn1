@@ -33,6 +33,9 @@ training:
   # Early stopping
   early_stopping_patience: 20
   min_epochs: 50
+  
+  # Gradient accumulation
+  grad_accum_steps: 2
 
 # Region normalization settings
 region_normalization:
@@ -50,7 +53,7 @@ pretrain:
 
 # Model architecture
 model:
-  hidden_dim: 64
+  hidden_dim: 32
   use_sparse_tensor: True
 
 # Original loss weights

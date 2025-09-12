@@ -70,11 +70,12 @@ class PRGNN_GUI(QMainWindow):
         
         # 基础训练参数
         self.lr_input = QLineEdit("0.001")
+        self.batch_size_input = QLineEdit("800")
         self.pre_epochs_input = QLineEdit("100")
         self.fine_epochs_input = QLineEdit("500")
         
         # 神经网络结构参数
-        self.hidden_dim_input = QLineEdit("64")
+        self.hidden_dim_input = QLineEdit("32")
         self.num_layers_input = QLineEdit("2")
         self.dropout_input = QLineEdit("0.1")
         self.batch_norm_check = QCheckBox("启用批归一化")
@@ -101,6 +102,7 @@ class PRGNN_GUI(QMainWindow):
         # 添加训练参数
         param_layout.addRow(QLabel("训练参数"))
         param_layout.addRow("学习率", self.lr_input)
+        param_layout.addRow("Batch Size", self.batch_size_input)
         param_layout.addRow("预训练轮数", self.pre_epochs_input)
         param_layout.addRow("微调轮数", self.fine_epochs_input)
         
@@ -209,7 +211,7 @@ class PRGNN_GUI(QMainWindow):
                 'weight_decay': 0.01,
                 'warmup_epochs': 10,
                 'cosine_epochs': 100,
-                'batch_size': 32,
+                'batch_size': int(self.batch_size_input.text()),
                 'neighbor_sampling': False,  # 默认关闭邻居采样
                 'num_neighbors': 25,  # 邻居采样数量
                 'early_stopping_patience': 20,  # 早停耐心值

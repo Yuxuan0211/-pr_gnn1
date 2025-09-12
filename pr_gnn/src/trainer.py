@@ -230,29 +230,22 @@ class PRGNNTrainer:
                 total_loss.backward()
                 self.optimizer.step()
                 
-                # 每10轮打印一次进度
-                if (epoch + 1) % 10 == 0 or epoch == adjusted_epochs - 1:
-                    print(f"🏁 区域 {region_id} - 轮次 {epoch + 1}/{adjusted_epochs} - 当前损失: {total_loss.item():.4f}")
+                # 每50轮记录一次进度
+                if (epoch + 1) % 50 == 0 or epoch == adjusted_epochs - 1:
+                    log_msg = f"[区域{region_id}] 轮次 {epoch + 1}/{adjusted_epochs} 损失: {total_loss.item():.4f}"
+                    if val_data is not None:
+                        val_loss = self._evaluate(val_data)['val_total_loss']
+                        log_msg += f" | 验证损失: {val_loss:.4f}"
+                    print(log_msg)
                 
                 # 记录训练损失
                 self.train_state['train_loss_history'].append(total_loss.item())
-
-                # 验证集评估（如果有）
-                val_loss_dict = {}
+                
+                # 验证集评估并更新学习率（如果有）
                 if val_data is not None:
                     val_loss_dict = self._evaluate(val_data)
                     self.train_state['val_loss_history'].append(val_loss_dict['val_total_loss'])
-                    # 更新学习率调度器
                     self.scheduler.step(val_loss_dict['val_total_loss'])
-
-                # 打印日志（每5个epoch）
-                if epoch % 5 == 0:
-                    log_msg = (f"区域 {region_id} | Epoch {epoch:3d}/{adjusted_epochs} | LR: {current_lr:.6f} | "
-                               f"Train Loss: {total_loss.item():.6f} | "
-                               f"Sup Loss: {loss_dict['L_supervised']:.6f}")
-                    if val_data is not None:
-                        log_msg += f" | Val Loss: {val_loss_dict['val_total_loss']:.6f}"
-                    print(log_msg)
 
                 # 收敛检验（如果有验证集）
                 if val_data is not None:
@@ -277,7 +270,14 @@ class PRGNNTrainer:
             'lr_history': self.train_state['lr_history']
         }
 
-    def global_finetune(self, data, epochs, val_data=None):
+    def global_finetune(self, data, epochs, val_data=None, batch_size=None):
+        # 处理多流场数据
+        if hasattr(data, 'multi_mach_y') and batch_size is not None:
+            # 随机选择batch_size个流场
+            selected_indices = torch.randperm(data.multi_mach_y.size(1))[:batch_size]
+            data.y = data.multi_mach_y[:, selected_indices].mean(dim=1)  # 使用均值作为当前批次的y
+            print(f"🔀 使用流场批次训练 (批次大小: {batch_size})")
+        
         data = data.to(self.device)
         if val_data is not None:
             val_data = val_data.to(self.device)
@@ -300,10 +300,12 @@ class PRGNNTrainer:
                 sizes=num_neighbors,
                 batch_size=batch_size,
                 shuffle=True,
-                num_workers=0
+                num_workers=2,
+                pin_memory=True
             )
             print(f"📊 全局微调配置：总节点数{total_nodes}，邻居采样batch size={batch_size}，邻居数={num_neighbors}")
         else:
+<<<<<<< HEAD
             # 动态调整batch size
             min_batch_size = 64
             max_batch_size = 2048
@@ -326,6 +328,10 @@ class PRGNNTrainer:
                     print(f"⚠️  显存限制，batch size从{batch_size}调整为{safe_batch_size}")
                     batch_size = safe_batch_size
             
+=======
+            # 使用配置中的batch size
+            batch_size = min(self.config['training']['batch_size'], total_nodes)
+>>>>>>> 04127fc6411003847074387eb6378920c0ab225b
             print(f"📊 全局微调配置：总节点数{total_nodes}，batch size={batch_size}，最大轮数={epochs}")
 
         # 梯度累积参数
@@ -473,14 +479,17 @@ class PRGNNTrainer:
                 self.scheduler.step(val_loss_dict['val_total_loss'])
 
             # 打印日志（每10个epoch）
-            if epoch % 10 == 0:
-                log_msg = (f"微调 Epoch {epoch:3d}/{epochs} | LR: {current_lr:.6f} | "
+                # 每50轮保存一次模型和状态
+                if epoch % 50 == 0 or epoch == epochs - 1:
+                    log_msg = (f"微调 Epoch {epoch:3d}/{epochs} | LR: {current_lr:.6f} | "
                            f"Avg Train Loss: {avg_train_loss:.6f}")
-                if val_data is not None:
-                    log_msg += (f" | Val Total Loss: {val_loss_dict['val_total_loss']:.6f} | "
-                               f"Val Sup Loss: {val_loss_dict['L_supervised']:.6f} | "
-                               f"Val Phys Loss: {val_loss_dict['L_thermo'] + val_loss_dict['L_vorticity']:.6f}")
-                print(log_msg)
+                    if val_data is not None:
+                        log_msg += (f" | Val Total Loss: {val_loss_dict['val_total_loss']:.6f}")
+                    print(log_msg)
+                    
+                    # 保存检查点
+                    self.save_model(f"models/checkpoint_epoch_{epoch}.pth")
+                    self.save_train_state(f"models/checkpoint_state_{epoch}.pth")
 
             # 收敛检验（如果有验证集）
             if val_data is not None:
